@@ -75,6 +75,14 @@ const els = {
   btnRollcallConfirm: $('#btn-rollcall-confirm'),
   btnRollcallSkip: $('#btn-rollcall-skip'),
   btnRollcallCancel: $('#btn-rollcall-cancel'),
+  // 议题投票
+  btnTopicNew: $('#btn-topic-new'),
+  topicForm: $('#topic-create-form'),
+  topicTitleInput: $('#topic-title-input'),
+  topicDuration: $('#topic-duration'),
+  btnTopicFormCancel: $('#btn-topic-cancel-form'),
+  topicCard: $('#topic-card'),
+  topicHistory: $('#topic-history'),
   toast: $('#toast-container')
 };
 
@@ -153,6 +161,16 @@ for (let m = 1; m <= 30; m++) {
 function chosenDurationMin() {
   const v = parseInt(els.speakDuration.value, 10);
   return Number.isInteger(v) && v >= 1 && v <= 30 ? v : null;
+}
+
+// 议题投票时长选项（秒）：15/30 秒、1/2/3/5/10 分钟
+const TOPIC_DURATION_OPTIONS = [15, 30, 60, 120, 180, 300, 600];
+for (const sec of TOPIC_DURATION_OPTIONS) {
+  const opt = document.createElement('option');
+  opt.value = String(sec);
+  opt.textContent = sec < 60 ? `${sec} 秒` : `${sec / 60} 分钟`;
+  if (sec === 60) opt.selected = true;
+  els.topicDuration.appendChild(opt);
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +519,7 @@ function render() {
   renderQueue(snap);
   renderUndoBar(snap);
   renderSwapBar(snap);
+  renderTopic(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -591,6 +610,7 @@ if (!state.timerHandle) {
   state.timerHandle = setInterval(() => {
     updateTimer();
     updateRollcallCountdown();
+    updateTopicCountdown();
   }, 250);
 }
 
@@ -773,11 +793,155 @@ function renderSwapBar(snap) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 议题投票：当前议题卡（实时票数 / 剩余时间 / 投票）与已结算结果
+// ---------------------------------------------------------------------------
+
+const TOPIC_WARN_MS = 10000;
+
+const TOPIC_CHOICE_TEXT = { yes: '赞成', no: '反对', abstain: '弃权' };
+const TOPIC_RESULT_TEXT = { passed: '✅ 通过', rejected: '❌ 否决', tie: '⚖️ 平票' };
+
+/** 主持人的「发起议题」表单：有进行中议题时隐藏（发起新议题会先结算旧议题） */
+function syncTopicFormVisibility() {
+  const hasOpen = !!(state.snapshot && state.snapshot.topic);
+  els.topicForm.classList.toggle('is-hidden', hasOpen);
+}
+
+function myTopicChoice(topic) {
+  if (!state.me) return null;
+  const mine = (topic.votes || []).find((v) => v.participantId === state.me.id);
+  return mine ? mine.choice : null;
+}
+
+/**
+ * 当前议题卡：
+ * - 进行中：实时票数（赞成/反对/弃权 + 占已投票比例）、服务端校准的剩余时间、
+ *   本人投票按钮（截止前可反复改投，高亮当前选择）、主持人「提前结束」；
+ * - 无议题：空状态。已结算议题在下方 history 列表展示。
+ */
+function renderTopic(snap) {
+  syncTopicFormVisibility();
+  const topic = snap.topic;
+  const card = els.topicCard;
+  card.textContent = '';
+
+  if (!topic) {
+    const empty = document.createElement('div');
+    empty.className = 'topic-empty';
+    empty.textContent = '暂无进行中的议题';
+    card.appendChild(empty);
+  } else {
+    const myChoice = myTopicChoice(topic);
+    const totalVotes = topic.votedCount || 0;
+    const remainMs = Math.max(topic.deadline - serverNow(), 0);
+    const closed = remainMs <= 0;
+
+    const head = document.createElement('div');
+    head.className = 'topic-head';
+    head.innerHTML = `
+      <span class="topic-status-tag ${closed ? 'closed' : 'open'}">${closed ? '已截止' : '投票中'}</span>
+      <span class="topic-title">${escapeHtml(topic.title)}</span>
+      <span class="topic-countdown" id="topic-countdown"></span>
+    `;
+    card.appendChild(head);
+
+    const tally = document.createElement('div');
+    tally.className = 'topic-tally';
+    for (const choice of ['yes', 'no', 'abstain']) {
+      const n = topic.counts[choice] || 0;
+      const pct = totalVotes > 0 ? Math.round((n / totalVotes) * 100) : 0;
+      const row = document.createElement('div');
+      row.className = `tally-row ${choice}${myChoice === choice ? ' is-picked' : ''}`;
+      row.innerHTML = `
+        <span class="tally-label"><span class="dot"></span>${TOPIC_CHOICE_TEXT[choice]}</span>
+        <span class="tally-bar"><span class="tally-fill" style="width:${totalVotes > 0 ? pct : 0}%"></span></span>
+        <span class="tally-meta">${n} 票 · ${pct}%</span>
+      `;
+      tally.appendChild(row);
+    }
+    card.appendChild(tally);
+
+    const meta = document.createElement('div');
+    meta.className = 'topic-result-meta';
+    meta.style.marginTop = '8px';
+    meta.textContent = `已投票 ${totalVotes} / ${snap.participants.length} 人${
+      myChoice ? `　·　我的选择：${TOPIC_CHOICE_TEXT[myChoice]}（截止前可改投）` : ''
+    }`;
+    card.appendChild(meta);
+
+    // 投票操作（主持人也可投票；截止后禁用，等待服务端结算快照）
+    const actions = document.createElement('div');
+    actions.className = 'topic-vote-actions';
+    for (const choice of ['yes', 'no', 'abstain']) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className =
+        `btn topic-vote-btn ${choice === 'yes' ? 'btn-primary' : choice === 'no' ? 'btn-danger' : 'btn-secondary'}` +
+        (myChoice === choice ? ' picked' : '');
+      btn.dataset.topicChoice = choice;
+      btn.disabled = closed;
+      btn.textContent = `${TOPIC_CHOICE_TEXT[choice]}${myChoice === choice ? ' ✓' : ''}`;
+      actions.appendChild(btn);
+    }
+    card.appendChild(actions);
+
+    if (state.me && state.me.host) {
+      const hostActions = document.createElement('div');
+      hostActions.className = 'topic-host-actions host-only';
+      const endBtn = document.createElement('button');
+      endBtn.type = 'button';
+      endBtn.className = 'btn btn-ghost btn-mini';
+      endBtn.id = 'btn-topic-end';
+      endBtn.textContent = '⏹ 提前结束并结算';
+      hostActions.appendChild(endBtn);
+      card.appendChild(hostActions);
+    }
+  }
+
+  updateTopicCountdown();
+  renderTopicHistory(snap);
+}
+
+function updateTopicCountdown() {
+  const topic = state.snapshot && state.snapshot.topic;
+  const el = document.getElementById('topic-countdown');
+  if (!topic || !el) return;
+  const remainMs = Math.max(topic.deadline - serverNow(), 0);
+  el.textContent = remainMs > 0 ? `剩余 ${formatDuration(remainMs)}` : '已截止，等待结算…';
+  el.classList.toggle('timer-warning', remainMs > 0 && remainMs <= TOPIC_WARN_MS);
+}
+
+/** 已结算议题列表（最近 N 条，最新在前） */
+function renderTopicHistory(snap) {
+  const box = els.topicHistory;
+  box.textContent = '';
+  const history = snap.topicHistory || [];
+  if (history.length === 0) return;
+
+  const title = document.createElement('div');
+  title.className = 'topic-history-title';
+  title.textContent = '已结算议题';
+  box.appendChild(title);
+
+  for (const t of history) {
+    const item = document.createElement('div');
+    item.className = 'topic-history-item';
+    const endedText = { deadline: '截止结算', host: '主持人结束', replaced: '被新议题替换' }[t.endedBy] || '';
+    item.innerHTML = `
+      <span class="th-result ${t.result}">${TOPIC_RESULT_TEXT[t.result] || t.result}</span>
+      <span class="th-title">${escapeHtml(t.title)}</span>
+      <span class="th-counts">赞成 ${t.counts.yes} · 反对 ${t.counts.no} · 弃权 ${t.counts.abstain}
+        （共 ${t.total} 票）· ${endedText} · ${formatTime(t.closedAt)}</span>
+    `;
+    box.appendChild(item);
+  }
+}
+
 function renderLogs(snap) {
   els.logList.textContent = '';
   // 最新的在最上面
-  for (let i = snap.logs.length - 1; i >= 0; i--) {
-    const log = snap.logs[i];
+  for (let i = snap.logs.length - 1; i >= 0; i--) {    const log = snap.logs[i];
     const li = document.createElement('li');
     li.className = `log-item kind-${log.kind}`;
     li.innerHTML = `<span class="log-time">${formatTime(log.ts)}</span><span>${escapeHtml(log.text)}</span>`;
@@ -855,6 +1019,50 @@ els.btnRollcallSkip.addEventListener('click', () => {
   const rc = state.snapshot && state.snapshot.rollcall;
   if (!rc) return;
   sendCmd({ type: 'rollcall_skip', callId: rc.callId });
+});
+
+// ---------------------------------------------------------------------------
+// 议题投票
+// ---------------------------------------------------------------------------
+
+els.btnTopicNew.addEventListener('click', () => {
+  els.topicForm.classList.remove('is-hidden');
+  els.topicTitleInput.focus();
+});
+
+els.btnTopicFormCancel.addEventListener('click', () => {
+  els.topicForm.classList.add('is-hidden');
+});
+
+els.topicForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const title = els.topicTitleInput.value.trim();
+  const durationSec = parseInt(els.topicDuration.value, 10);
+  if (!title) return toast('请填写议题标题', 'error');
+  const snap = state.snapshot;
+  // 进行中议题会被立即提前结算
+  if (snap && snap.topic && !confirm('当前已有进行中的议题，发布新议题将立即结算旧议题，确定继续？')) {
+    return;
+  }
+  sendCmd({ type: 'topic_create', title, durationSec });
+  els.topicTitleInput.value = '';
+  els.topicForm.classList.add('is-hidden');
+});
+
+// 投票（赞成/反对/弃权）：携带 topicId，服务端同时校验版本与议题 id
+els.topicCard.addEventListener('click', (e) => {
+  const voteBtn = e.target.closest('button[data-topic-choice]');
+  if (voteBtn && !voteBtn.disabled) {
+    const topic = state.snapshot && state.snapshot.topic;
+    if (!topic) return;
+    sendCmd({ type: 'topic_vote', topicId: topic.id, choice: voteBtn.dataset.topicChoice });
+    return;
+  }
+  const endBtn = e.target.closest('#btn-topic-end');
+  if (endBtn) {
+    if (!confirm('确定提前结束当前议题并立即结算？')) return;
+    sendCmd({ type: 'topic_end' });
+  }
 });
 
 // 安全撤销条：撤销最近一次主持人操作（版本冲突仍走 STALE_VERSION 流程）

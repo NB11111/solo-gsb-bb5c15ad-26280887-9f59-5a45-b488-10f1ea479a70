@@ -119,6 +119,35 @@
         </div>
       </div>
 
+      <!-- 议题投票 -->
+      <div class="panel panel-topic">
+        <div class="panel-title">
+          🗳️ 议题投票
+          <button class="btn btn-primary btn-mini host-only topic-create-toggle" id="btn-topic-new"
+                  type="button" title="发起新的当前议题（自动结算旧议题）">＋ 发起议题</button>
+        </div>
+
+        <!-- 主持人：创建当前议题 -->
+        <form class="topic-create host-only" id="topic-create-form">
+          <input type="text" id="topic-title-input" maxlength="80"
+                 placeholder="输入议题标题（如：是否同意下周团建？）" autocomplete="off" />
+          <div class="topic-create-row">
+            <label class="duration-picker" title="投票截止时长（到期自动结算）">
+              截止
+              <select id="topic-duration"></select>
+            </label>
+            <button class="btn btn-primary btn-mini" type="submit">发布并开始投票</button>
+            <button class="btn btn-ghost btn-mini" id="btn-topic-cancel-form" type="button">取消</button>
+          </div>
+        </form>
+
+        <!-- 当前议题 / 空状态 -->
+        <div class="topic-card" id="topic-card"></div>
+
+        <!-- 已结算议题 -->
+        <div class="topic-history" id="topic-history"></div>
+      </div>
+
       <!-- 右侧：记录 + 成员 -->
       <div class="panel panel-side panel-logs">
         <div class="panel-title">
