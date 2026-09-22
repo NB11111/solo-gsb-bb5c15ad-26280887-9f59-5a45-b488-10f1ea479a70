@@ -21,7 +21,11 @@ const state = {
   swapSeeded: false,
   swapStatus: new Map(),
   // 安全撤销：最近一次已展示的撤销状态（用于检测可用/失效/已撤销的跳变）
-  undoSeen: null
+  undoSeen: null,
+  // 议题投票：最近一次已展示的议题状态（用于检测新议题/已结算的跳变）
+  voteSeen: null,
+  // 议题投票：待确认的投票请求（并发投票版本过期时按最新版本静默重试）
+  pendingVoteCast: null
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -75,6 +79,22 @@ const els = {
   btnRollcallConfirm: $('#btn-rollcall-confirm'),
   btnRollcallSkip: $('#btn-rollcall-skip'),
   btnRollcallCancel: $('#btn-rollcall-cancel'),
+  voteEmpty: $('#vote-empty'),
+  voteBody: $('#vote-body'),
+  voteStatusTag: $('#vote-status-tag'),
+  voteCountdown: $('#vote-countdown'),
+  voteTitle: $('#vote-title'),
+  voteCountFor: $('#vote-count-for'),
+  voteCountAgainst: $('#vote-count-against'),
+  voteCountAbstain: $('#vote-count-abstain'),
+  voteMeta: $('#vote-meta'),
+  voteResult: $('#vote-result'),
+  voteActions: $('#vote-actions'),
+  voteHostActions: $('#vote-host-actions'),
+  btnVoteEnd: $('#btn-vote-end'),
+  formVoteCreate: $('#form-vote-create'),
+  voteTitleInput: $('#vote-title-input'),
+  voteDuration: $('#vote-duration'),
   toast: $('#toast-container')
 };
 
@@ -231,6 +251,8 @@ function enterRoom(creds) {
   state.swapSeeded = false;
   state.swapStatus = new Map();
   state.undoSeen = null;
+  state.voteSeen = null;
+  state.pendingVoteCast = null;
   state.intentionalClose = false;
   state.reconnectDelay = 500;
 
@@ -306,7 +328,7 @@ function wsSend(obj) {
 
 function sendCmd(obj) {
   obj.version = state.version;
-  wsSend(obj);
+  return wsSend(obj);
 }
 
 function setConn(status) {
@@ -330,10 +352,12 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'joined': {
       state.me = msg.you;
-      // 首次快照只播种状态，不把重连前已存在的邀请/撤销状态当成新变化弹提示
+      // 首次快照只播种状态，不把重连前已存在的邀请/撤销/议题状态当成新变化弹提示
       state.swapSeeded = false;
       state.swapStatus = new Map();
       state.undoSeen = null;
+      state.voteSeen = null;
+      state.pendingVoteCast = null;
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
       creds.id = msg.you.id;
@@ -351,9 +375,13 @@ function handleMessage(msg) {
     case 'snapshot':
       applySnapshot(msg.snapshot);
       break;
-    case 'error':
+    case 'error': {
+      if (msg.snapshot) applySnapshot(msg.snapshot);
       if (msg.code === 'STALE_VERSION') {
-        toast(`状态已过期，已同步到最新版本`, 'error');
+        // 并发投票导致的版本过期：用最新版本静默重试（限次数），成功则不打扰用户
+        if (!retryPendingVoteCast()) {
+          toast(`状态已过期，已同步到最新版本`, 'error');
+        }
       } else if (msg.code === 'NO_ROOM') {
         toast('房间不存在或已被回收', 'error');
         state.intentionalClose = true;
@@ -363,8 +391,8 @@ function handleMessage(msg) {
       } else {
         toast(msg.error || '操作失败', 'error');
       }
-      if (msg.snapshot) applySnapshot(msg.snapshot);
       break;
+    }
     case 'kicked':
       toast(msg.reason || '你已在其他页面打开此房间', 'error');
       state.intentionalClose = true;
@@ -382,6 +410,8 @@ function applySnapshot(snap) {
   els.versionBadge.textContent = `v${snap.version}`;
   processSwaps(snap);
   processUndo(snap);
+  processVote(snap);
+  syncPendingVoteCast(snap);
   render();
 }
 
@@ -490,6 +520,85 @@ function processSwaps(snap) {
 }
 
 // ---------------------------------------------------------------------------
+// 议题投票：新议题 / 结算反馈；并发投票过期时按最新版本静默重试
+// ---------------------------------------------------------------------------
+
+const VOTE_CHOICE_TEXT = { for: '赞成', against: '反对', abstain: '弃权' };
+// 投票倒计时最后 10 秒醒目提示
+const VOTE_WARN_MS = 10000;
+// 版本过期自动重试次数上限（并发投票时他人的提交会使本地版本过期）
+const VOTE_CAST_MAX_RETRY = 2;
+
+/** 议题状态签名：topicId + 状态，用于检测「新议题」与「已结算」跳变 */
+function voteSignature(v) {
+  if (!v) return 'none';
+  return `${v.topicId}:${v.status}`;
+}
+
+function processVote(snap) {
+  const v = snap.vote || null;
+  const sig = voteSignature(v);
+  if (state.voteSeen === null) {
+    // 首次快照（含重连）只播种，不提示
+    state.voteSeen = sig;
+    return;
+  }
+  if (sig === state.voteSeen) return;
+  const prev = state.voteSeen;
+  state.voteSeen = sig;
+  if (v && v.status === 'open') {
+    toast(`新议题投票：「${v.title}」，截止前可投一票并修改`, 'info');
+  } else if (v && v.status === 'settled' && prev === `${v.topicId}:open` && v.result) {
+    const r = v.result;
+    toast(`议题已结算：赞成 ${r.for} / 反对 ${r.against} / 弃权 ${r.abstain}`, 'success');
+  }
+}
+
+/** 投/改一票：记录待确认请求并发送（服务端按议题 id 与版本原子校验） */
+function castVote(choice) {
+  const v = state.snapshot && state.snapshot.vote;
+  if (!v || v.status !== 'open') return;
+  state.pendingVoteCast = { topicId: v.topicId, choice, retries: 0 };
+  sendCmd({ type: 'vote_cast', topicId: v.topicId, choice });
+}
+
+/**
+ * STALE_VERSION 时调用：若存在未确认的投票且议题仍在进行中，
+ * 用最新版本静默重试（投票是幂等的自我覆盖操作，重试安全）。
+ * 返回 true 表示已处理（不再弹「状态已过期」提示）。
+ */
+function retryPendingVoteCast() {
+  const p = state.pendingVoteCast;
+  if (!p) return false;
+  const v = state.snapshot && state.snapshot.vote;
+  if (!v || v.status !== 'open' || v.topicId !== p.topicId) return false;
+  const myChoice = state.me ? (v.ballots || {})[state.me.id] : null;
+  if (myChoice === p.choice) {
+    // 实际已生效（如重试与广播乱序），无需重试也不必提示
+    state.pendingVoteCast = null;
+    return true;
+  }
+  if (p.retries >= VOTE_CAST_MAX_RETRY) return false;
+  p.retries += 1;
+  sendCmd({ type: 'vote_cast', topicId: p.topicId, choice: p.choice });
+  return true;
+}
+
+/** 按快照清理待确认投票：已生效则确认；议题切换/结算则放弃重试 */
+function syncPendingVoteCast(snap) {
+  const p = state.pendingVoteCast;
+  if (!p || !state.me) return;
+  const v = snap.vote;
+  if (!v || v.topicId !== p.topicId || v.status !== 'open') {
+    state.pendingVoteCast = null;
+    return;
+  }
+  if ((v.ballots || {})[state.me.id] === p.choice) {
+    state.pendingVoteCast = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 渲染
 // ---------------------------------------------------------------------------
 
@@ -498,6 +607,7 @@ function render() {
   if (!snap) return;
   renderStage(snap);
   renderRollcall(snap);
+  renderVote(snap);
   renderQueue(snap);
   renderUndoBar(snap);
   renderSwapBar(snap);
@@ -569,6 +679,77 @@ function updateRollcallCountdown() {
   els.rollcallCountdown.classList.toggle('timer-warning', remainMs <= ROLLCALL_WARN_MS);
 }
 
+/**
+ * 议题投票卡：展示当前议题、实时票数、剩余时间与已结算结果；
+ * 进行中时所有人可投/改一票，主持人可提前结算或发起新议题。
+ */
+function renderVote(snap) {
+  const v = snap.vote;
+  const open = !!(v && v.status === 'open');
+  // 主持人创建表单：无议题或已结算时可用（发起新议题会替换旧议题）
+  els.formVoteCreate.classList.toggle('hidden', open);
+
+  if (!v) {
+    els.voteEmpty.classList.remove('hidden');
+    els.voteBody.classList.add('hidden');
+    els.voteStatusTag.classList.add('hidden');
+    els.voteCountdown.classList.add('hidden');
+    return;
+  }
+  els.voteEmpty.classList.add('hidden');
+  els.voteBody.classList.remove('hidden');
+  els.voteTitle.textContent = v.title;
+
+  const counts = !open && v.result ? v.result : v.counts;
+  els.voteCountFor.textContent = counts.for;
+  els.voteCountAgainst.textContent = counts.against;
+  els.voteCountAbstain.textContent = counts.abstain;
+
+  els.voteStatusTag.classList.remove('hidden');
+  els.voteStatusTag.textContent = open ? '投票中' : '已结算';
+  els.voteStatusTag.classList.toggle('is-settled', !open);
+  els.voteCountdown.classList.toggle('hidden', !open);
+
+  // 投票按钮：进行中可投/改票，高亮我的选择（重连后凭 ballots 恢复）
+  const myChoice = state.me ? (v.ballots || {})[state.me.id] : null;
+  els.voteActions.classList.toggle('hidden', !open);
+  for (const btn of els.voteActions.querySelectorAll('button[data-choice]')) {
+    btn.classList.toggle('is-choice', open && btn.dataset.choice === myChoice);
+  }
+
+  if (open) {
+    els.voteMeta.textContent = `已投 ${v.total}/${snap.participants.length} 人 · 截止前可改票`;
+    els.voteResult.classList.add('hidden');
+  } else {
+    const r = v.result;
+    const how = r && r.reason === 'deadline' ? '到点自动结算' : '主持人提前结算';
+    els.voteMeta.textContent = r
+      ? `${formatTime(r.settledAt)} ${how} · 共 ${r.total} 人投票`
+      : '已结算';
+    if (r) {
+      els.voteResult.classList.remove('hidden');
+      els.voteResult.innerHTML =
+        `结果：<b class="res-for">${VOTE_CHOICE_TEXT.for} ${r.for}</b> · ` +
+        `<b class="res-against">${VOTE_CHOICE_TEXT.against} ${r.against}</b> · ` +
+        `<b class="res-abstain">${VOTE_CHOICE_TEXT.abstain} ${r.abstain}</b>`;
+    } else {
+      els.voteResult.classList.add('hidden');
+    }
+  }
+
+  // 主持人：进行中可提前结算
+  els.voteHostActions.classList.toggle('hidden', !open);
+  updateVoteCountdown();
+}
+
+function updateVoteCountdown() {
+  const v = state.snapshot && state.snapshot.vote;
+  if (!v || v.status !== 'open') return;
+  const remainMs = Math.max(v.deadline - serverNow(), 0);
+  els.voteCountdown.textContent = `剩余 ${formatDuration(remainMs)}`;
+  els.voteCountdown.classList.toggle('timer-warning', remainMs <= VOTE_WARN_MS);
+}
+
 function updateTimer() {
   const snap = state.snapshot;
   if (!snap || !snap.speaking) return;
@@ -591,6 +772,7 @@ if (!state.timerHandle) {
   state.timerHandle = setInterval(() => {
     updateTimer();
     updateRollcallCountdown();
+    updateVoteCountdown();
   }, 250);
 }
 
@@ -823,7 +1005,7 @@ els.btnEnd.addEventListener('click', () => {
 });
 
 els.btnClearAll.addEventListener('click', () => {
-  if (!confirm('确定一键清空？\n将清空发言队列、结束当前发言并清空操作记录。')) return;
+  if (!confirm('确定一键清空？\n将清空发言队列、结束当前发言、丢弃当前议题并清空操作记录。')) return;
   sendCmd({ type: 'clear' });
 });
 
@@ -855,6 +1037,35 @@ els.btnRollcallSkip.addEventListener('click', () => {
   const rc = state.snapshot && state.snapshot.rollcall;
   if (!rc) return;
   sendCmd({ type: 'rollcall_skip', callId: rc.callId });
+});
+
+// ---------------------------------------------------------------------------
+// 议题投票
+// ---------------------------------------------------------------------------
+
+els.formVoteCreate.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const title = els.voteTitleInput.value.trim();
+  if (!title) return toast('请输入议题标题', 'error');
+  const durationSec = parseInt(els.voteDuration.value, 10);
+  if (sendCmd({ type: 'vote_start', title, durationSec })) {
+    els.voteTitleInput.value = '';
+  }
+});
+
+// 投/改一票：与当前选择相同则不重复发送；并发过期由静默重试兜底
+els.voteActions.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-choice]');
+  if (!btn) return;
+  const v = state.snapshot && state.snapshot.vote;
+  if (!v || v.status !== 'open') return;
+  const myChoice = state.me ? (v.ballots || {})[state.me.id] : null;
+  if (btn.dataset.choice === myChoice) return;
+  castVote(btn.dataset.choice);
+});
+
+els.btnVoteEnd.addEventListener('click', () => {
+  sendCmd({ type: 'vote_end' });
 });
 
 // 安全撤销条：撤销最近一次主持人操作（版本冲突仍走 STALE_VERSION 流程）

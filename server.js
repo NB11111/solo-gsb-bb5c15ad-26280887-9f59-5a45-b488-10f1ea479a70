@@ -24,6 +24,9 @@
  *   { type: "rollcall_confirm",version, callId }        // 当前点名对象确认（同时校验 version + callId）
  *   { type: "rollcall_skip",   version, callId }        // 当前点名对象主动跳过（同时校验 version + callId）
  *   { type: "rollcall_cancel", version }                // 主持人：取消点名
+ *   { type: "vote_start",  version, title, durationSec }   // 主持人：发起议题投票（1~3600 秒，到点自动结算）
+ *   { type: "vote_cast",   version, topicId, choice }      // 投/改一票：choice 为 for|against|abstain
+ *   { type: "vote_end",    version }                       // 主持人：提前结束并结算当前议题
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -56,6 +59,17 @@
  * 主持人可 rollcall_cancel；主持人直接请人发言、一键清空、被点名人离开/取消/
  * 被移出都会结束或推进本轮点名。断线不影响服务端计时，重连后凭快照恢复当前
  * 对象与剩余倒计时。点名期间不允许换位/重排，点名启动会使挂起撤销失效。
+ *
+ * 议题投票：主持人 vote_start 创建当前议题并设定截止时间（durationSec 秒），
+ * 快照 vote 字段下发 topicId / title / deadline / 实时票数 counts / 记名选票
+ * ballots / 结算结果 result。参与者在截止前对「赞成 for / 反对 against /
+ * 弃权 abstain」投一票，截止前可重复提交改票；vote_cast 同时校验 version 与
+ * topicId（原子校验），旧议题或过期版本的命令一律拒绝（BAD_TOPIC /
+ * STALE_VERSION）。服务端为当前议题安排到期定时任务，到点自动结算当前议题
+ * （version+1 并写操作记录）；切换或结束议题时旧定时器已清理，回调内再校验
+ * topicId 与状态，旧回调直接忽略、不会结算新议题。主持人 vote_end 可提前结算；
+ * 一键清空丢弃当前议题；成员主动离开移除其未结算选票（断线保留），重连后凭
+ * 快照恢复议题、我的选票与剩余时间。
  */
 
 'use strict';
@@ -79,6 +93,10 @@ const SPEAK_MIN_MINUTES = 1;
 const SPEAK_MAX_MINUTES = 30;
 // 队首点名接力：每人的确认时限（默认 20 秒）。测试可调小以快速验证超时接力
 const ROLLCALL_TIMEOUT_MS = parseInt(process.env.ROLLCALL_TIMEOUT_MS, 10) || 20000;
+// 议题投票：时长单位（默认 1 秒）。测试可调小以快速验证到期自动结算
+const VOTE_TIME_UNIT_MS = parseInt(process.env.VOTE_TIME_UNIT_MS, 10) || 1000;
+const VOTE_MIN_SECONDS = 1;
+const VOTE_MAX_SECONDS = 3600;
 
 const app = express();
 const server = http.createServer(app);
@@ -109,6 +127,15 @@ app.use(express.static(path.join(__dirname, 'public')));
  *     pending: [id],         // 本轮冻结的待点名名单（启动时按队列顺序拷贝）
  *     called: Set<id>        // 本轮已点名成员（含已确认/已跳过/中途失效）
  *   },
+ *   vote: null | {
+ *     topicId,               // 当前议题唯一标识（投票命令须携带并校验）
+ *     title,                 // 议题标题
+ *     createdAt, deadline,   // 创建时间与截止时间（ms）
+ *     status: 'open'|'settled',
+ *     ballots: Map<participantId, 'for'|'against'|'abstain'>,
+ *     result: null | { for, against, abstain, total, settledAt, reason }
+ *   },
+ *   voteTimer,               // 当前议题的到期定时器（Timeout | null）
  *   swaps: Map<id, {
  *     id, from, to,          // 发起人 / 目标方 participantId
  *     version, fromPos, toPos,  // 发起时的队列版本与位置（下标）
@@ -138,6 +165,8 @@ function newRoom(code) {
     speaking: null,
     speakTimer: null,
     rollcall: null,
+    vote: null,
+    voteTimer: null,
     swaps: new Map(),
     undo: null,
     logs: [],
@@ -352,6 +381,84 @@ function rollcallTimeout(room, targetId) {
 }
 
 // ---------------------------------------------------------------------------
+// 议题投票
+// ---------------------------------------------------------------------------
+
+/** 议题投票选项 -> 快照/日志中展示的文案 */
+const VOTE_CHOICE_TEXT = { for: '赞成', against: '反对', abstain: '弃权' };
+const VOTE_CHOICES = new Set(Object.keys(VOTE_CHOICE_TEXT));
+
+/** 清理当前议题的到期定时器（切换/结束/清空议题、房间回收时调用） */
+function clearVoteTimer(room) {
+  if (room.voteTimer) {
+    clearTimeout(room.voteTimer);
+    room.voteTimer = null;
+  }
+}
+
+/**
+ * 为当前议题安排到期自动结算。
+ * 回调内以 topicId + 状态二次校验：旧议题（已切换/已结束）的回调直接忽略，
+ * 截止回调只结算当前议题。
+ */
+function scheduleVoteTimer(room) {
+  clearVoteTimer(room);
+  const vote = room.vote;
+  if (!vote || vote.status !== 'open') return;
+  const topicId = vote.topicId;
+  const delay = Math.max(vote.deadline - Date.now(), 0);
+  room.voteTimer = setTimeout(() => {
+    room.voteTimer = null;
+    if (!room.vote || room.vote.topicId !== topicId) return; // 旧回调作废
+    if (room.vote.status !== 'open') return;
+    settleVote(room, 'deadline');
+  }, delay);
+  if (room.voteTimer.unref) room.voteTimer.unref();
+}
+
+function tallyVotes(vote) {
+  const counts = { for: 0, against: 0, abstain: 0 };
+  for (const choice of vote.ballots.values()) counts[choice] += 1;
+  return counts;
+}
+
+/**
+ * 结算当前议题：统计票数、写入结构化结果与操作记录，并作为一次
+ * 普通版本化状态变更提交（version+1、广播快照、使挂起撤销失效）。
+ * 到期回调与主持人提前结算共用此入口。
+ */
+function settleVote(room, reason) {
+  const vote = room.vote;
+  if (!vote || vote.status !== 'open') return false;
+  clearVoteTimer(room);
+  const counts = tallyVotes(vote);
+  vote.status = 'settled';
+  vote.result = {
+    for: counts.for,
+    against: counts.against,
+    abstain: counts.abstain,
+    total: vote.ballots.size,
+    settledAt: Date.now(),
+    reason // deadline（到点自动结算）| host（主持人提前结算）
+  };
+  const summary = `赞成 ${counts.for} / 反对 ${counts.against} / 弃权 ${counts.abstain}`;
+  addLog(
+    room,
+    'vote',
+    reason === 'deadline'
+      ? `议题「${vote.title}」已到截止时间，自动结算：${summary}`
+      : `主持人提前结算议题「${vote.title}」：${summary}`
+  );
+  commit(room, { undoReason: 'vote_changed' });
+  return true;
+}
+
+/** 投票时长文案：整分钟显示分钟，否则显示秒 */
+function voteDurationText(sec) {
+  return sec % 60 === 0 ? `${sec / 60} 分钟` : `${sec} 秒`;
+}
+
+// ---------------------------------------------------------------------------
 // 安全撤销
 // ---------------------------------------------------------------------------
 
@@ -362,6 +469,7 @@ const UNDO_REASON_TEXT = {
   presence_changed: '房间成员发生变化',
   swap_changed: '换位状态出现新的变更',
   rollcall_changed: '队首点名接力状态出现新的变更',
+  vote_changed: '议题投票状态出现新的变更',
   cleared: '主持人清空了队列',
   logs_cleared: '主持人清空了操作记录',
   state_changed: '房间状态出现新的变更'
@@ -492,6 +600,24 @@ function uniqueNick(room, nick) {
   return name + crypto.randomBytes(2).toString('hex');
 }
 
+/** 议题投票快照：实时票数、截止时间、记名选票（ballots）与已结算结果 */
+function buildVoteSnapshot(room) {
+  const vote = room.vote;
+  const ballots = {};
+  for (const [pid, choice] of vote.ballots) ballots[pid] = choice;
+  return {
+    topicId: vote.topicId,
+    title: vote.title,
+    createdAt: vote.createdAt,
+    deadline: vote.deadline,
+    status: vote.status,
+    counts: tallyVotes(vote), // 实时票数
+    total: vote.ballots.size,
+    ballots,                  // participantId -> choice（记名投票）
+    result: vote.result       // 已结算结果（未结算为 null）
+  };
+}
+
 /**
  * 构建快照。服务端时钟随快照下发（serverTs），
  * 客户端据此修正时钟偏差计算发言时长。
@@ -525,6 +651,7 @@ function buildSnapshot(room) {
           called: [...room.rollcall.called]
         }
       : null,
+    vote: room.vote ? buildVoteSnapshot(room) : null,
     participants: [...room.participants.values()].map((p) => ({
       id: p.id,
       nick: p.nick,
@@ -667,6 +794,9 @@ wss.on('connection', (ws) => {
         case 'rollcall_confirm':
         case 'rollcall_skip':
         case 'rollcall_cancel':
+        case 'vote_start':
+        case 'vote_cast':
+        case 'vote_end':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -845,6 +975,10 @@ function handleLeave(room, id, reason) {
   invalidateSwaps(room, 'left', (s) => s.from === id || s.to === id, (side, s) =>
     s[side] === id ? nick : room.participants.get(s[side])?.nick ?? '已离开'
   );
+  // 主动离开：移除其在进行中议题上的选票（已结算议题保留历史记录；断线不移除）
+  if (room.vote && room.vote.status === 'open' && room.vote.ballots.delete(id)) {
+    addLog(room, 'vote', `「${nick}」离开房间，其选票已移除`);
+  }
   if (queuedIdx !== -1) room.order.splice(queuedIdx, 1);
   room.participants.delete(id);
   // 点名进行中：离开者若为当前对象，立即点名下一人；否则其待点名位置自然跳过
@@ -1233,9 +1367,11 @@ function handleCommand(ws, msg, room, pid, isHost) {
       clearSpeakTimer(room);
       room.speaking = null;
       finishRollcall(room);
+      clearVoteTimer(room);
+      room.vote = null;
       room.logs = [];
       invalidateSwaps(room, 'cleared');
-      addLog(room, 'system', '主持人执行了一键清空（队列、当前发言、操作记录已重置）');
+      addLog(room, 'system', '主持人执行了一键清空（队列、当前发言、议题投票、操作记录已重置）');
       return commit(room, { undoReason: 'cleared' });
     }
 
@@ -1244,6 +1380,91 @@ function handleCommand(ws, msg, room, pid, isHost) {
       room.logs = [];
       addLog(room, 'system', '主持人清空了操作记录');
       return commit(room, { undoReason: 'logs_cleared' });
+    }
+
+    case 'vote_start': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const title = String(msg.title ?? '').trim().slice(0, 60);
+      if (!title) return sendError(ws, '议题标题不能为空', 'BAD_TITLE', room);
+      const durationSec = Number(msg.durationSec);
+      if (
+        !Number.isInteger(durationSec) ||
+        durationSec < VOTE_MIN_SECONDS ||
+        durationSec > VOTE_MAX_SECONDS
+      ) {
+        return sendError(
+          ws,
+          `投票时长须为 ${VOTE_MIN_SECONDS}～${VOTE_MAX_SECONDS} 秒的整数`,
+          'BAD_DURATION',
+          room
+        );
+      }
+      // 切换议题：旧议题（进行中或已结算）随新议题创建被替换，旧定时器立即失效
+      if (room.vote) {
+        if (room.vote.status === 'open') {
+          addLog(room, 'vote', `议题「${room.vote.title}」未结算，已被新议题替换`);
+        }
+        clearVoteTimer(room);
+        room.vote = null;
+      }
+      const now = Date.now();
+      room.vote = {
+        topicId: genId('vt_'),
+        title,
+        createdAt: now,
+        deadline: now + durationSec * VOTE_TIME_UNIT_MS,
+        status: 'open',
+        ballots: new Map(),
+        result: null
+      };
+      scheduleVoteTimer(room);
+      addLog(room, 'vote', `主持人发起议题投票：「${title}」（${voteDurationText(durationSec)}内投票，到点自动结算）`);
+      return commit(room, { undoReason: 'vote_changed' });
+    }
+
+    case 'vote_cast': {
+      if (!guardVersion(ws, msg, room)) return;
+      const vote = room.vote;
+      if (!vote) return sendError(ws, '当前没有议题投票', 'VOTE_NONE', room);
+      // 议题 id 与版本原子校验：旧议题的投票命令一律拒绝
+      if (typeof msg.topicId !== 'string' || msg.topicId !== vote.topicId) {
+        return sendError(ws, '议题已切换，请按最新议题投票', 'BAD_TOPIC', room);
+      }
+      if (vote.status !== 'open') {
+        return sendError(ws, '该议题已结算，投票通道关闭', 'VOTE_CLOSED', room);
+      }
+      if (Date.now() >= vote.deadline) {
+        // 已过截止时刻、到期回调尚未执行：按已截止处理，回调随后结算
+        return sendError(ws, '投票已截止', 'VOTE_CLOSED', room);
+      }
+      const choice = String(msg.choice || '');
+      if (!VOTE_CHOICES.has(choice)) {
+        return sendError(ws, '无效选项（for 赞成 / against 反对 / abstain 弃权）', 'BAD_CHOICE', room);
+      }
+      const prev = vote.ballots.get(pid);
+      if (prev === choice) {
+        return sendError(ws, '你与之前的投票相同，无需重复提交', 'NO_CHANGE', room);
+      }
+      // 一人一票，截止前可改票（覆盖原选择）
+      vote.ballots.set(pid, choice);
+      addLog(
+        room,
+        'vote',
+        prev
+          ? `「${me.nick}」改票：${VOTE_CHOICE_TEXT[prev]} → ${VOTE_CHOICE_TEXT[choice]}`
+          : `「${me.nick}」投票：${VOTE_CHOICE_TEXT[choice]}`
+      );
+      return commit(room, { undoReason: 'vote_changed' });
+    }
+
+    case 'vote_end': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const vote = room.vote;
+      if (!vote) return sendError(ws, '当前没有议题投票', 'VOTE_NONE', room);
+      if (vote.status !== 'open') return sendError(ws, '该议题已结算', 'VOTE_CLOSED', room);
+      // 提前结算：清理定时器、统计票数、提交版本（与到期结算共用入口）
+      settleVote(room, 'host');
+      return;
     }
 
     case 'rollcall_start': {
@@ -1443,6 +1664,7 @@ const heartbeat = setInterval(() => {
     if (!anyOnline && now - room.lastSeen > ROOM_TTL_MS) {
       clearSpeakTimer(room);
       clearRollcallTimer(room);
+      clearVoteTimer(room);
       rooms.delete(code);
     }
   }

@@ -12,6 +12,8 @@ const BASE = `http://127.0.0.1:${TEST_PORT}`;
 const SPEAK_TIME_UNIT_MS = 50;
 // 测试用：点名确认时限压缩为 800ms，便于快速验证超时接力
 const ROLLCALL_TIMEOUT_MS = 800;
+// 测试用：议题投票的 1「秒」压缩为 50ms，便于快速验证到期自动结算
+const VOTE_TIME_UNIT_MS = 50;
 let failures = 0;
 let serverProc = null;
 
@@ -1177,6 +1179,190 @@ async function main() {
     await h.close(); await g2b.close(); await g3.close();
   }
 
+  // ===========================================================================
+  // 议题投票（VOTE_TIME_UNIT_MS=50ms：协议中的 1「秒」= 50ms）
+  // ===========================================================================
+  {
+    const created = await createRoom('投票主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '投甲');
+    const g2 = await guestJoin(created.room, '投乙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    await waitStable(h, [g1, g2]);
+
+    // 24a. 权限与参数校验：非主持人不能发起；空标题/非法时长被拒且不改版本
+    await guestSend(h, g1, { type: 'vote_start', title: 'x', durationSec: 10 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    h.lastError = null;
+    h.send({ type: 'vote_start', version: h.v, title: '   ', durationSec: 10 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TITLE');
+    for (const bad of [0, 3601, 1.5, 'abc']) {
+      const vBad = h.v;
+      h.lastError = null;
+      h.send({ type: 'vote_start', version: h.v, title: '议题', durationSec: bad });
+      await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_DURATION');
+      assert.strictEqual(h.v, vBad, '非法时长不得改变版本');
+    }
+
+    // 无议题时的投票 / 结束命令
+    await guestSend(h, g1, { type: 'vote_cast', topicId: 'vt_none', choice: 'for' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'VOTE_NONE');
+    h.lastError = null;
+    h.send({ type: 'vote_end', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'VOTE_NONE');
+
+    // 24b. 主持人创建议题：快照下发 topicId / title / deadline / 实时票数
+    await hostCmd(h, { type: 'vote_start', title: '是否采纳方案 A', durationSec: 60 });
+    let vote = h.snapshot.vote;
+    assert.ok(vote && vote.status === 'open');
+    assert.ok(/^vt_/.test(vote.topicId), '议题需有唯一 topicId');
+    assert.strictEqual(vote.title, '是否采纳方案 A');
+    assert.strictEqual(vote.deadline - vote.createdAt, 60 * VOTE_TIME_UNIT_MS);
+    assert.ok(vote.deadline > h.snapshot.serverTs, '截止时间应在未来');
+    assert.deepStrictEqual(vote.counts, { for: 0, against: 0, abstain: 0 });
+    assert.strictEqual(vote.total, 0);
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'vote' && /发起议题投票/.test(l.text)));
+    const topic1 = vote.topicId;
+
+    // 24c. 投票 / 改票：按议题 id 与版本原子校验，实时票数随快照广播
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topic1, choice: 'for' });
+    await h.waitFor((c) => c.snapshot.vote && c.snapshot.vote.counts.for === 1);
+    await guestSend(h, g2, { type: 'vote_cast', topicId: topic1, choice: 'against' });
+    await h.waitFor((c) => c.snapshot.vote.counts.against === 1);
+    // 改票：一票由赞成改为弃权，原选择计数回落
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topic1, choice: 'abstain' });
+    await h.waitFor((c) => c.snapshot.vote.counts.abstain === 1);
+    vote = h.snapshot.vote;
+    assert.strictEqual(vote.counts.for, 0, '改票后原选择计数回落');
+    assert.strictEqual(vote.total, 2, '每人只计一票');
+    assert.strictEqual(vote.ballots[id1], 'abstain');
+    assert.strictEqual(vote.ballots[id2], 'against');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'vote' && /改票/.test(l.text)));
+    // 重复相同选择 -> NO_CHANGE
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topic1, choice: 'abstain' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'NO_CHANGE');
+    // 非法选项 / 旧议题 id / 过期版本
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topic1, choice: 'maybe' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_CHOICE');
+    await guestSend(h, g1, { type: 'vote_cast', topicId: 'vt_stale', choice: 'for' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TOPIC');
+    g1.lastError = null;
+    g1.send({ type: 'vote_cast', version: g1.v - 1, topicId: topic1, choice: 'for' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.snapshot.vote.total, 2, '被拒命令不改变票数');
+
+    // 24d. 主持人提前结算：结果冻结并写记录；结算后投票被拒；旧定时器不再产生版本
+    await hostCmd(h, { type: 'vote_end' });
+    vote = h.snapshot.vote;
+    assert.strictEqual(vote.status, 'settled');
+    assert.strictEqual(vote.result.reason, 'host');
+    assert.deepStrictEqual(
+      { for: vote.result.for, against: vote.result.against, abstain: vote.result.abstain },
+      { for: 0, against: 1, abstain: 1 }
+    );
+    assert.strictEqual(vote.result.total, 2);
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'vote' && /提前结算/.test(l.text)));
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topic1, choice: 'for' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'VOTE_CLOSED');
+    h.lastError = null;
+    h.send({ type: 'vote_end', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'VOTE_CLOSED');
+    const vAfterEnd = h.v;
+    await sleep(60 * VOTE_TIME_UNIT_MS + 300); // 远超原截止时间
+    assert.strictEqual(h.v, vAfterEnd, '提前结算后旧定时器不得再产生版本变更');
+    assert.strictEqual(h.snapshot.vote.status, 'settled');
+
+    // 24e. 切换议题：新议题替换旧议题并清理旧定时器，旧截止回调直接忽略
+    await hostCmd(h, { type: 'vote_start', title: '议题 B', durationSec: 30 }); // 1500ms 后到期
+    const topicB = h.snapshot.vote.topicId;
+    assert.notStrictEqual(topicB, topic1, '新议题应有新的 topicId');
+    assert.strictEqual(h.snapshot.vote.total, 0, '新议题选票重置');
+    // 立即再切换为议题 C（更长）：B 的到期回调不得结算 C
+    await hostCmd(h, { type: 'vote_start', title: '议题 C', durationSec: 90 }); // 4500ms 后到期
+    const topicC = h.snapshot.vote.topicId;
+    const vAfterC = h.v;
+    assert.ok(
+      h.snapshot.logs.some((l) => l.kind === 'vote' && /未结算，已被新议题替换/.test(l.text)),
+      '切换进行中的议题需记录替换日志'
+    );
+    await sleep(30 * VOTE_TIME_UNIT_MS + 400); // 越过 B 的原截止时间，C 仍未到期
+    assert.strictEqual(h.v, vAfterC, '旧议题的截止回调不得产生版本变更');
+    assert.ok(
+      h.snapshot.vote && h.snapshot.vote.topicId === topicC && h.snapshot.vote.status === 'open',
+      '旧回调不得结算新议题'
+    );
+
+    // 24f. 到点自动结算：version+1、写操作记录、结果含 deadline 原因
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topicC, choice: 'for' });
+    await h.waitFor((c) => c.snapshot.vote && c.snapshot.vote.counts.for === 1);
+    await guestSend(h, g2, { type: 'vote_cast', topicId: topicC, choice: 'for' });
+    await h.waitFor((c) => c.snapshot.vote.counts.for === 2);
+    const vBeforeSettle = h.v;
+    await h.waitFor(
+      (c) => c.snapshot.vote && c.snapshot.vote.status === 'settled',
+      90 * VOTE_TIME_UNIT_MS + 2000,
+      '议题 C 到点自动结算'
+    );
+    vote = h.snapshot.vote;
+    assert.strictEqual(vote.topicId, topicC, '截止回调只结算当前议题');
+    assert.strictEqual(vote.result.reason, 'deadline');
+    assert.strictEqual(vote.result.for, 2);
+    assert.strictEqual(h.v, vBeforeSettle + 1, '自动结算恰好产生一个新版本');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'vote' && /已到截止时间，自动结算/.test(l.text)));
+
+    // 24g. 截止后投票被拒（无论到期回调是否已执行）
+    await hostCmd(h, { type: 'vote_start', title: '议题 D', durationSec: 2 }); // 100ms 后到期
+    const topicD = h.snapshot.vote.topicId;
+    await sleep(2 * VOTE_TIME_UNIT_MS + 150); // 越过截止时间
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topicD, choice: 'for' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'VOTE_CLOSED');
+    await h.waitFor((c) => c.snapshot.vote && c.snapshot.vote.status === 'settled', 2000);
+
+    // 24h. 成员主动离开移除未结算选票；断线保留，重连后议题与选票恢复
+    await hostCmd(h, { type: 'vote_start', title: '议题 E', durationSec: 120 }); // 6s 后到期
+    const topicE = h.snapshot.vote.topicId;
+    await guestSend(h, g1, { type: 'vote_cast', topicId: topicE, choice: 'for' });
+    await h.waitFor((c) => c.snapshot.vote && c.snapshot.vote.counts.for === 1);
+    await guestSend(h, g2, { type: 'vote_cast', topicId: topicE, choice: 'against' });
+    await h.waitFor((c) => c.snapshot.vote.counts.against === 1);
+    assert.strictEqual(h.snapshot.vote.total, 2);
+    g1.send({ type: 'leave' });
+    await h.waitFor((c) => c.snapshot.vote && c.snapshot.vote.total === 1);
+    assert.strictEqual(h.snapshot.vote.counts.for, 0, '离开者的选票被移除');
+    assert.strictEqual(h.snapshot.vote.counts.against, 1);
+    const g2Secret = g2.joined.you.secret;
+    await g2.close(); // 断线：选票保留
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id2);
+      return p && p.online === false;
+    });
+    assert.strictEqual(h.snapshot.vote.total, 1, '断线保留选票');
+    const g2b = new Client();
+    await g2b.open();
+    g2b.send({ type: 'join', room: created.room, nick: '投乙', participantId: id2, secret: g2Secret });
+    await g2b.waitFor((c) => c.joined && c.joined.you.id === id2);
+    assert.ok(g2b.snapshot.vote && g2b.snapshot.vote.topicId === topicE, '重连后议题恢复');
+    assert.strictEqual(g2b.snapshot.vote.deadline, h.snapshot.vote.deadline, '重连后截止时间不变');
+    assert.strictEqual(g2b.snapshot.vote.ballots[id2], 'against', '重连后我的选票仍在');
+    // 重连后仍可改票
+    await guestSend(h, g2b, { type: 'vote_cast', topicId: topicE, choice: 'abstain' });
+    await h.waitFor((c) => c.snapshot.vote && c.snapshot.vote.counts.abstain === 1);
+
+    // 24i. 一键清空丢弃当前议题并清理旧定时器
+    await hostCmd(h, { type: 'vote_end' }); // 先结算议题 E，避免等待其截止
+    await hostCmd(h, { type: 'vote_start', title: '议题 F', durationSec: 4 }); // 200ms 后到期
+    await hostCmd(h, { type: 'clear' });
+    assert.strictEqual(h.snapshot.vote, null, '一键清空丢弃当前议题');
+    const vAfterClear = h.v;
+    await sleep(4 * VOTE_TIME_UNIT_MS + 300);
+    assert.strictEqual(h.v, vAfterClear, '清空后旧定时器不得再产生版本变更');
+    assert.strictEqual(h.snapshot.vote, null);
+
+    await h.close(); await g1.close(); await g2b.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();
@@ -1194,7 +1380,7 @@ async function main() {
 function startServer() {
   return new Promise((resolve, reject) => {
     serverProc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS), ROLLCALL_TIMEOUT_MS: String(ROLLCALL_TIMEOUT_MS) },
+      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS), ROLLCALL_TIMEOUT_MS: String(ROLLCALL_TIMEOUT_MS), VOTE_TIME_UNIT_MS: String(VOTE_TIME_UNIT_MS) },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let settled = false;

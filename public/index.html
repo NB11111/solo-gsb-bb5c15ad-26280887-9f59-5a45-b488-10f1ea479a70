@@ -104,6 +104,52 @@
           </div>
         </div>
 
+        <!-- 议题投票卡：主持人发起议题并设定截止时间；成员在截止前投一票（可改票），到点自动结算 -->
+        <div class="vote-card" id="vote-card">
+          <div class="vote-head">
+            <span class="vote-head-title">🗳️ 议题投票</span>
+            <span class="vote-status-tag hidden" id="vote-status-tag">投票中</span>
+            <span class="vote-countdown hidden" id="vote-countdown"></span>
+          </div>
+
+          <div class="vote-empty" id="vote-empty">暂无议题，等待主持人发起投票</div>
+
+          <div class="vote-body hidden" id="vote-body">
+            <div class="vote-title" id="vote-title"></div>
+            <div class="vote-counts">
+              <div class="vote-count is-for"><b id="vote-count-for">0</b><span>赞成</span></div>
+              <div class="vote-count is-against"><b id="vote-count-against">0</b><span>反对</span></div>
+              <div class="vote-count is-abstain"><b id="vote-count-abstain">0</b><span>弃权</span></div>
+            </div>
+            <div class="vote-meta" id="vote-meta"></div>
+            <div class="vote-result hidden" id="vote-result"></div>
+            <div class="vote-actions hidden" id="vote-actions">
+              <button class="btn vote-btn vote-btn-for" data-choice="for" type="button">👍 赞成</button>
+              <button class="btn vote-btn vote-btn-against" data-choice="against" type="button">👎 反对</button>
+              <button class="btn vote-btn vote-btn-abstain" data-choice="abstain" type="button">✋ 弃权</button>
+            </div>
+            <div class="vote-host-actions host-only" id="vote-host-actions">
+              <button class="btn btn-danger btn-mini" id="btn-vote-end" type="button">结束并结算</button>
+            </div>
+          </div>
+
+          <form class="vote-create host-only hidden" id="form-vote-create">
+            <input type="text" id="vote-title-input" maxlength="60"
+                   placeholder="输入议题标题（如：是否采纳方案 A）" autocomplete="off" />
+            <div class="vote-create-row">
+              <select id="vote-duration" title="投票时长，到点自动结算">
+                <option value="30">30 秒</option>
+                <option value="60" selected>1 分钟</option>
+                <option value="120">2 分钟</option>
+                <option value="180">3 分钟</option>
+                <option value="300">5 分钟</option>
+                <option value="600">10 分钟</option>
+              </select>
+              <button type="submit" class="btn btn-primary">🗳️ 发起投票</button>
+            </div>
+          </form>
+        </div>
+
         <ul class="queue-list" id="queue-list"></ul>
         <div class="queue-empty" id="queue-empty">队列为空，等待申请发言</div>
 
